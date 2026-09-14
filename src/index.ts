@@ -11,7 +11,7 @@ const SERVER_SECRET =
   process.env.SERVER_SECRET || "CHANGE_THIS_SECRET";
 
 const SIGNER_ID =
-  process.env.SIGNER_ID || "1bb80515895760f5";
+  process.env.SIGNER_ID || "3bb80515895760f5";
 
 const SIGNING_PRIVATE_KEY = (
   process.env.SIGNING_PRIVATE_KEY || ""
