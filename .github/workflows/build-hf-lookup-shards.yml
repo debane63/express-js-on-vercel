@@ -6,6 +6,8 @@ on:
     paths:
       - ".github/workflows/build-hf-lookup-shards.yml"
       - "scripts/build_hf_lookup_shards.py"
+  issues:
+    types: [opened]
   workflow_dispatch:
 
 permissions:
@@ -13,6 +15,9 @@ permissions:
 
 jobs:
   build:
+    if: >
+      github.event_name != 'issues' ||
+      github.event.issue.title == 'BUILD_HF_LOOKUP_SHARDS'
     runs-on: ubuntu-latest
     timeout-minutes: 360
     env:
