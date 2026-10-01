@@ -68,6 +68,78 @@ app.get("/", (_req, res) => {
   });
 });
 
+
+app.get("/tester", (_req, res) => {
+  res.type("html").send(`<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>AIM-AI2 API Tester</title>
+  <style>
+    body{font-family:system-ui;background:#0b0b0f;color:#fff;margin:0;padding:24px}
+    .wrap{max-width:720px;margin:auto}
+    input,select,button{width:100%;box-sizing:border-box;padding:14px;margin:8px 0;border-radius:10px;border:1px solid #333;background:#17171d;color:#fff}
+    button{background:#6d5dfc;border:0;font-weight:700}
+    pre{white-space:pre-wrap;word-break:break-word;background:#111117;padding:16px;border-radius:12px;min-height:120px}
+    .muted{color:#aaa;font-size:14px}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h2>AIM-AI2 API Tester</h2>
+    <div class="muted">API key is sent only in the x-api-key header, not in the URL.</div>
+    <input id="search" placeholder="Search value, e.g. 1038991535" inputmode="numeric" />
+    <select id="field">
+      <option value="auto">auto</option>
+      <option value="telegram_id">telegram_id</option>
+      <option value="phone">phone</option>
+    </select>
+    <input id="key" placeholder="API key" type="password" autocomplete="off" />
+    <button id="send">Send Request</button>
+    <pre id="out">Ready.</pre>
+  </div>
+<script>
+const out = document.getElementById("out");
+document.getElementById("send").onclick = async () => {
+  const search = document.getElementById("search").value.trim();
+  const field = document.getElementById("field").value;
+  const key = document.getElementById("key").value.trim();
+
+  if (!search || !key) {
+    out.textContent = "Enter search value and API key.";
+    return;
+  }
+
+  out.textContent = "Sending request...";
+
+  try {
+    const u = new URL("/api", location.origin);
+    u.searchParams.set("search", search);
+    u.searchParams.set("field", field);
+
+    const r = await fetch(u, {
+      headers: {
+        "x-api-key": key,
+        "accept": "application/json"
+      }
+    });
+
+    const text = await r.text();
+    let body;
+    try { body = JSON.parse(text); } catch { body = text; }
+
+    out.textContent = "HTTP " + r.status + "\n\n" +
+      (typeof body === "string" ? body : JSON.stringify(body, null, 2));
+  } catch (e) {
+    out.textContent = "Request failed: " + String(e);
+  }
+};
+</script>
+</body>
+</html>`);
+});
+
 app.get("/health", (_req, res) => {
   res.json({
     success: true,
