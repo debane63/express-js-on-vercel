@@ -180,3 +180,5 @@ manifest.write_text(
 fs.put(str(manifest), f"buckets/{BUCKET}/{PREFIX}/manifest.txt")
 
 print("DONE")
+
+# workflow-trigger: 2026-10-01
