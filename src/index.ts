@@ -150,54 +150,86 @@ app.get("/", (_req, res) => {
 app.get("/health", async (_req, res) => {
   try {
     const state = await getDbState();
-    const tg = quoteIdentifier(state.columns.telegram);
-    const url = quoteLiteral(DATASET_URL);
 
-    // Harmless exact-filter probe: validates the same remote Parquet query
-    // path used by /api without exposing or looking up a real identifier.
-    await state.connection.runAndReadAll(
-      `SELECT 1
-       FROM read_parquet(${url})
-       WHERE CAST(${tg} AS VARCHAR) = $q
-       LIMIT 1`,
-      { q: "__hf_api_health_probe_74fa2c__" }
-    );
+    const sizeUrl =
+      "https://datasets-server.huggingface.co/size?dataset=deban420/my-first-data-api";
+
+    const sizeResp = await fetch(sizeUrl, {
+      signal: AbortSignal.timeout(10000)
+    });
+
+    const sizeJson: any = await sizeResp.json();
+
+    let totalRows =
+      sizeJson?.size?.dataset?.num_rows ||
+      sizeJson?.size?.configs?.[0]?.num_rows ||
+      sizeJson?.size?.configs?.[0]?.splits?.[0]?.num_rows ||
+      0;
+
+    totalRows = Number(totalRows || 0);
+
+    let sampleOrderMonotonic: boolean | null = null;
+    let checkedSamples = 0;
+
+    if (Number.isFinite(totalRows) && totalRows > 10) {
+      const offsets = Array.from({ length: 9 }, (_, i) =>
+        Math.floor((i * (totalRows - 1)) / 8)
+      );
+
+      const samples = await Promise.all(
+        offsets.map(async (offset) => {
+          const u = new URL(
+            "https://datasets-server.huggingface.co/rows"
+          );
+          u.searchParams.set(
+            "dataset",
+            "deban420/my-first-data-api"
+          );
+          u.searchParams.set("config", "default");
+          u.searchParams.set("split", "train");
+          u.searchParams.set("offset", String(offset));
+          u.searchParams.set("length", "1");
+
+          const r = await fetch(u, {
+            signal: AbortSignal.timeout(10000)
+          });
+
+          if (!r.ok) {
+            throw new Error("rows endpoint returned " + r.status);
+          }
+
+          const j: any = await r.json();
+          const row = j?.rows?.[0]?.row || {};
+          const raw = String(row["Telegram ID"] ?? "");
+          const numeric = /^\d+$/.test(raw) ? BigInt(raw) : null;
+
+          return numeric;
+        })
+      );
+
+      checkedSamples = samples.length;
+
+      if (samples.every((v) => v !== null)) {
+        sampleOrderMonotonic = true;
+
+        for (let i = 1; i < samples.length; i++) {
+          if ((samples[i] as bigint) < (samples[i - 1] as bigint)) {
+            sampleOrderMonotonic = false;
+            break;
+          }
+        }
+      } else {
+        sampleOrderMonotonic = false;
+      }
+    }
 
     return res.json({
       success: true,
       status: "ready",
       source: "Hugging Face remote Parquet",
-      columnsDetected: 4,
-      mappedColumns: Object.keys(state.columns),
-      exactFilterProbe: "ok",
-      datasetServerFilter: await (async () => {
-        const started = Date.now();
-        const where = '"Telegram ID"=\'__hf_api_health_probe_74fa2c__\'';
-        const u = new URL("https://datasets-server.huggingface.co/filter");
-        u.searchParams.set("dataset", "deban420/my-first-data-api");
-        u.searchParams.set("config", "default");
-        u.searchParams.set("split", "train");
-        u.searchParams.set("where", where);
-        u.searchParams.set("offset", "0");
-        u.searchParams.set("length", "1");
-        try {
-          const r = await fetch(u, { signal: AbortSignal.timeout(15000) });
-          const body = await r.text();
-          return {
-            status: r.status,
-            ok: r.ok,
-            elapsed_ms: Date.now() - started,
-            preview: body.slice(0, 160)
-          };
-        } catch (e) {
-          return {
-            status: 0,
-            ok: false,
-            elapsed_ms: Date.now() - started,
-            preview: String(e).slice(0, 160)
-          };
-        }
-      })()
+      totalRows,
+      checkedSamples,
+      telegramIdSampleOrderMonotonic: sampleOrderMonotonic
     });
   } catch (error) {
     console.error("health/init error", error);
