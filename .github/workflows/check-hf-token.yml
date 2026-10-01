@@ -1,0 +1,23 @@
+name: Check HF Token
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    if: github.event.issue.title == 'CHECK_HF_TOKEN'
+    runs-on: ubuntu-latest
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+    steps:
+      - name: Check token presence
+        run: |
+          if [ -z "$HF_TOKEN" ]; then
+            echo "HF_TOKEN_PRESENT=false"
+            exit 2
+          fi
+          echo "HF_TOKEN_PRESENT=true"
