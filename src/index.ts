@@ -70,71 +70,171 @@ app.get("/", (_req, res) => {
 
 
 app.get("/tester", (_req, res) => {
+  res.setHeader("cache-control", "no-store");
   res.type("html").send(`<!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1" />
   <title>AIM-AI2 API Tester</title>
   <style>
-    body{font-family:system-ui;background:#0b0b0f;color:#fff;margin:0;padding:24px}
+    *{box-sizing:border-box}
+    body{font-family:system-ui,-apple-system,sans-serif;background:#0b0b0f;color:#fff;margin:0;padding:18px}
     .wrap{max-width:720px;margin:auto}
-    input,select,button{width:100%;box-sizing:border-box;padding:14px;margin:8px 0;border-radius:10px;border:1px solid #333;background:#17171d;color:#fff}
-    button{background:#6d5dfc;border:0;font-weight:700}
-    pre{white-space:pre-wrap;word-break:break-word;background:#111117;padding:16px;border-radius:12px;min-height:120px}
-    .muted{color:#aaa;font-size:14px}
+    h2{margin:4px 0 8px}
+    .muted{color:#aaa;font-size:13px;margin-bottom:12px}
+    label{display:block;margin-top:12px;font-size:13px;color:#bbb}
+    input,select,button{width:100%;padding:15px;margin-top:6px;border-radius:11px;border:1px solid #34343d;background:#17171d;color:#fff;font-size:16px}
+    button{background:#6d5dfc;border:0;font-weight:800;min-height:52px}
+    button:disabled{opacity:.55}
+    .status{margin:14px 0;padding:13px 14px;border-radius:10px;background:#17171d;font-weight:700}
+    .ok{background:#12351f}
+    .bad{background:#441717}
+    .busy{background:#2f2a12}
+    pre{white-space:pre-wrap;word-break:break-word;background:#111117;padding:16px;border-radius:12px;min-height:160px;font-size:14px}
+    .row{display:flex;gap:8px;align-items:center}
+    .row input{flex:1}
+    .small{width:auto;padding:12px 14px}
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <h2>AIM-AI2 API Tester</h2>
-    <div class="muted">API key is sent only in the x-api-key header, not in the URL.</div>
-    <input id="search" placeholder="Search value, e.g. 1038991535" inputmode="numeric" />
-    <select id="field">
-      <option value="auto">auto</option>
-      <option value="telegram_id">telegram_id</option>
-      <option value="phone">phone</option>
-    </select>
-    <input id="key" placeholder="API key" type="password" autocomplete="off" />
-    <button id="send">Send Request</button>
-    <pre id="out">Ready.</pre>
+<div class="wrap">
+  <h2>AIM-AI2 API Tester</h2>
+  <div class="muted">এই page API key-টা URL-এ দেয় না; x-api-key header-এ পাঠায়।</div>
+
+  <div id="status" class="status">Ready</div>
+
+  <label>Search value</label>
+  <input id="search" placeholder="e.g. 1038991535" inputmode="numeric" autocomplete="off" />
+
+  <label>Field</label>
+  <select id="field">
+    <option value="auto">auto</option>
+    <option value="telegram_id">telegram_id</option>
+    <option value="phone">phone</option>
+  </select>
+
+  <label>API key</label>
+  <div class="row">
+    <input id="key" placeholder="Paste API key" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" />
+    <button id="toggle" class="small" type="button">Show</button>
   </div>
+
+  <button id="send" type="button">Send Request</button>
+
+  <pre id="out">Result will appear here.</pre>
+</div>
+
 <script>
-const out = document.getElementById("out");
-document.getElementById("send").onclick = async () => {
-  const search = document.getElementById("search").value.trim();
-  const field = document.getElementById("field").value;
-  const key = document.getElementById("key").value.trim();
+(() => {
+  const EXPECTED_HASH = "01ea8d6a3e5cc51153344f97a924727112ba10b0f51f959928e08a6a734e70d4";
+  const searchEl = document.getElementById("search");
+  const fieldEl = document.getElementById("field");
+  const keyEl = document.getElementById("key");
+  const send = document.getElementById("send");
+  const toggle = document.getElementById("toggle");
+  const status = document.getElementById("status");
+  const out = document.getElementById("out");
 
-  if (!search || !key) {
-    out.textContent = "Enter search value and API key.";
-    return;
+  function cleanKey(v) {
+    return String(v || "")
+      .replace(/[\\s\\u200B-\\u200D\\uFEFF]/g, "")
+      .trim();
   }
 
-  out.textContent = "Sending request...";
+  async function hashHex(value) {
+    const data = new TextEncoder().encode(value);
+    const digest = await crypto.subtle.digest("SHA-256", data);
+    return Array.from(new Uint8Array(digest))
+      .map(b => b.toString(16).padStart(2, "0"))
+      .join("");
+  }
 
-  try {
-    const u = new URL("/api", location.origin);
-    u.searchParams.set("search", search);
-    u.searchParams.set("field", field);
+  function setStatus(text, cls) {
+    status.className = "status " + (cls || "");
+    status.textContent = text;
+  }
 
-    const r = await fetch(u, {
-      headers: {
-        "x-api-key": key,
-        "accept": "application/json"
+  toggle.addEventListener("click", () => {
+    const show = keyEl.type === "password";
+    keyEl.type = show ? "text" : "password";
+    toggle.textContent = show ? "Hide" : "Show";
+  });
+
+  send.addEventListener("click", async () => {
+    const search = searchEl.value.trim();
+    const field = fieldEl.value;
+    const key = cleanKey(keyEl.value);
+
+    out.textContent = "";
+
+    if (!search) {
+      setStatus("Search value দাও", "bad");
+      searchEl.focus();
+      return;
+    }
+
+    if (!key) {
+      setStatus("API key দাও", "bad");
+      keyEl.focus();
+      return;
+    }
+
+    send.disabled = true;
+    send.textContent = "Checking...";
+    setStatus("API key check করছি...", "busy");
+
+    try {
+      const actualHash = await hashHex(key);
+
+      if (actualHash !== EXPECTED_HASH) {
+        setStatus("API key match করছে না", "bad");
+        out.textContent = "তুমি যে API key paste করেছ সেটা server-এর configured key-এর সাথে মিলছে না.\n\nKey-টা আবার exact copy/paste করো.";
+        out.scrollIntoView({ behavior: "smooth", block: "center" });
+        return;
       }
-    });
 
-    const text = await r.text();
-    let body;
-    try { body = JSON.parse(text); } catch { body = text; }
+      setStatus("API key ঠিক আছে — request পাঠাচ্ছি...", "busy");
+      send.textContent = "Sending...";
 
-    out.textContent = "HTTP " + r.status + "\n\n" +
-      (typeof body === "string" ? body : JSON.stringify(body, null, 2));
-  } catch (e) {
-    out.textContent = "Request failed: " + String(e);
-  }
-};
+      const u = new URL("/api", location.origin);
+      u.searchParams.set("search", search);
+      u.searchParams.set("field", field);
+
+      const r = await fetch(u.toString(), {
+        method: "GET",
+        headers: {
+          "x-api-key": key,
+          "accept": "application/json"
+        },
+        cache: "no-store"
+      });
+
+      const raw = await r.text();
+      let body;
+      try { body = JSON.parse(raw); } catch { body = raw; }
+
+      if (r.ok) {
+        setStatus("Success — HTTP " + r.status, "ok");
+      } else {
+        setStatus("Request failed — HTTP " + r.status, "bad");
+      }
+
+      out.textContent =
+        "HTTP " + r.status + "\n\n" +
+        (typeof body === "string" ? body : JSON.stringify(body, null, 2));
+
+      out.scrollIntoView({ behavior: "smooth", block: "start" });
+    } catch (e) {
+      setStatus("Browser error", "bad");
+      out.textContent = String(e);
+      out.scrollIntoView({ behavior: "smooth", block: "center" });
+    } finally {
+      send.disabled = false;
+      send.textContent = "Send Request";
+    }
+  });
+})();
 </script>
 </body>
 </html>`);
