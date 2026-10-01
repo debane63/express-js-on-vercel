@@ -4,28 +4,20 @@ import { DuckDBInstance } from "@duckdb/node-api";
 
 const app = express();
 
-const DATASET_URL =
-  process.env.DATASET_URL ||
-  "https://huggingface.co/datasets/deban420/my-first-data-api/resolve/main/train.parquet";
+const LOOKUP_BASE =
+  process.env.LOOKUP_BASE ||
+  "https://huggingface.co/buckets/deban420/my-fast-data-bucket/resolve/lookup-v1";
 
-// The raw API key is not stored in this public repository.
-// SHA-256(API key) only:
 const API_KEY_SHA256 =
   process.env.API_KEY_SHA256 ||
   "01ea8d6a3e5cc51153344f97a924727112ba10b0f51f959928e08a6a734e70d4";
 
 type DbState = {
   connection: any;
-  columns: {
-    telegram: string;
-    phone: string;
-    firstName: string;
-    lastName: string;
-  };
 };
 
 const globalState = globalThis as typeof globalThis & {
-  __hfDbState?: Promise<DbState>;
+  __hfLookupDbState?: Promise<DbState>;
   __rateMap?: Map<string, { windowStart: number; count: number }>;
 };
 
@@ -41,10 +33,6 @@ function safeEqualHex(a: string, b: string) {
   } catch {
     return false;
   }
-}
-
-function quoteIdentifier(name: string) {
-  return '"' + name.replaceAll('"', '""') + '"';
 }
 
 function quoteLiteral(value: string) {
@@ -82,160 +70,88 @@ function rateAllowed(req: express.Request) {
 async function createDbState(): Promise<DbState> {
   const instance = await DuckDBInstance.create(":memory:", {
     threads: "2",
-    memory_limit: "768MB"
+    memory_limit: "768MB",
   });
 
   const connection = await instance.connect();
 
-  // Vercel functions do not expose a normal HOME directory. DuckDB needs
-  // one for extension installation/cache, so use the writable /tmp volume.
   await connection.run("SET home_directory='/tmp'");
-
-  // httpfs enables HTTP range reads. Parquet metadata/needed column chunks
-  // are fetched remotely instead of downloading the whole file first.
   await connection.run("INSTALL httpfs");
   await connection.run("LOAD httpfs");
 
-  const url = quoteLiteral(DATASET_URL);
-
-  const schemaReader = await connection.runAndReadAll(
-    `DESCRIBE SELECT * FROM read_parquet(${url})`
-  );
-
-  const schemaRows = schemaReader.getRowsJson();
-
-  if (schemaRows.length < 4) {
-    throw new Error(
-      `Expected at least four columns in Parquet, found ${schemaRows.length}`
-    );
-  }
-
-  const names = schemaRows.slice(0, 4).map((row: any[]) => String(row[0]));
-
-  return {
-    connection,
-    columns: {
-      telegram: names[0],
-      phone: names[1],
-      firstName: names[2],
-      lastName: names[3]
-    }
-  };
+  return { connection };
 }
 
 function getDbState() {
-  if (!globalState.__hfDbState) {
-    globalState.__hfDbState = createDbState().catch((error) => {
-      // Allow a later invocation to retry initialization after a transient
-      // remote/network error.
-      globalState.__hfDbState = undefined;
+  if (!globalState.__hfLookupDbState) {
+    globalState.__hfLookupDbState = createDbState().catch((error) => {
+      globalState.__hfLookupDbState = undefined;
       throw error;
     });
   }
 
-  return globalState.__hfDbState;
+  return globalState.__hfLookupDbState;
+}
+
+function shardForNumericKey(value: string) {
+  const digits = value.replace(/\D/g, "");
+  if (!digits) return null;
+  return digits.slice(-2).padStart(2, "0");
 }
 
 app.get("/", (_req, res) => {
   res.json({
     success: true,
-    service: "HF Remote Parquet Search API",
+    service: "HF Sharded Lookup API",
     status: "online",
     endpoint: "/api?search=VALUE",
     authentication: "x-api-key header required",
-    modes: ["auto", "telegram_id", "phone", "first_name", "last_name"]
+    indexedFields: ["telegram_id", "phone"],
+    strategy: "100-way last-two-digits shard + sorted Parquet pruning",
   });
 });
 
 app.get("/health", async (_req, res) => {
   try {
-    const state = await getDbState();
+    const manifestUrl = LOOKUP_BASE + "/manifest.txt?download=true";
 
-    const sizeUrl =
-      "https://datasets-server.huggingface.co/size?dataset=deban420/my-first-data-api";
-
-    const sizeResp = await fetch(sizeUrl, {
-      signal: AbortSignal.timeout(10000)
+    const r = await fetch(manifestUrl, {
+      signal: AbortSignal.timeout(8000),
+      cache: "no-store",
     });
 
-    const sizeJson: any = await sizeResp.json();
-
-    let totalRows =
-      sizeJson?.size?.dataset?.num_rows ||
-      sizeJson?.size?.configs?.[0]?.num_rows ||
-      sizeJson?.size?.configs?.[0]?.splits?.[0]?.num_rows ||
-      0;
-
-    totalRows = Number(totalRows || 0);
-
-    let sampleOrderMonotonic: boolean | null = null;
-    let checkedSamples = 0;
-
-    if (Number.isFinite(totalRows) && totalRows > 10) {
-      const offsets = Array.from({ length: 9 }, (_, i) =>
-        Math.floor((i * (totalRows - 1)) / 8)
-      );
-
-      const samples = await Promise.all(
-        offsets.map(async (offset) => {
-          const u = new URL(
-            "https://datasets-server.huggingface.co/rows"
-          );
-          u.searchParams.set(
-            "dataset",
-            "deban420/my-first-data-api"
-          );
-          u.searchParams.set("config", "default");
-          u.searchParams.set("split", "train");
-          u.searchParams.set("offset", String(offset));
-          u.searchParams.set("length", "1");
-
-          const r = await fetch(u, {
-            signal: AbortSignal.timeout(10000)
-          });
-
-          if (!r.ok) {
-            throw new Error("rows endpoint returned " + r.status);
-          }
-
-          const j: any = await r.json();
-          const row = j?.rows?.[0]?.row || {};
-          const raw = String(row["Telegram ID"] ?? "");
-          const numeric = /^\d+$/.test(raw) ? BigInt(raw) : null;
-
-          return numeric;
-        })
-      );
-
-      checkedSamples = samples.length;
-
-      if (samples.every((v) => v !== null)) {
-        sampleOrderMonotonic = true;
-
-        for (let i = 1; i < samples.length; i++) {
-          if ((samples[i] as bigint) < (samples[i - 1] as bigint)) {
-            sampleOrderMonotonic = false;
-            break;
-          }
-        }
-      } else {
-        sampleOrderMonotonic = false;
-      }
+    if (!r.ok) {
+      return res.status(503).json({
+        success: false,
+        status: "index_not_ready",
+        index_ready: false,
+        manifest_status: r.status,
+      });
     }
+
+    const manifest = await r.text();
 
     return res.json({
       success: true,
       status: "ready",
-      source: "Hugging Face remote Parquet",
-      totalRows,
-      checkedSamples,
-      telegramIdSampleOrderMonotonic: sampleOrderMonotonic
+      index_ready: true,
+      lookup_base: LOOKUP_BASE,
+      manifest: manifest
+        .split("\n")
+        .filter(Boolean)
+        .reduce((acc: Record<string, string>, line) => {
+          const i = line.indexOf("=");
+          if (i > 0) acc[line.slice(0, i)] = line.slice(i + 1);
+          return acc;
+        }, {}),
     });
   } catch (error) {
-    console.error("health/init error", error);
+    console.error("health error", error);
+
     return res.status(503).json({
       success: false,
-      status: "database_unavailable"
+      status: "index_not_ready",
+      index_ready: false,
     });
   }
 });
@@ -244,14 +160,14 @@ async function searchHandler(req: express.Request, res: express.Response) {
   if (!authorized(req)) {
     return res.status(401).json({
       success: false,
-      error: "Unauthorized"
+      error: "Unauthorized",
     });
   }
 
   if (!rateAllowed(req)) {
     return res.status(429).json({
       success: false,
-      error: "Too many requests"
+      error: "Too many requests",
     });
   }
 
@@ -261,85 +177,71 @@ async function searchHandler(req: express.Request, res: express.Response) {
   if (!search) {
     return res.status(400).json({
       success: false,
-      error: "Missing search parameter"
+      error: "Missing search parameter",
     });
   }
 
-  if (search.length > 160) {
-    return res.status(400).json({
-      success: false,
-      error: "Search value is too long"
-    });
-  }
-
-  const validFields = new Set([
-    "auto",
-    "telegram",
-    "telegram_id",
-    "phone",
-    "first_name",
-    "last_name"
-  ]);
-
-  if (!validFields.has(field)) {
+  if (!/^\d+$/.test(search)) {
     return res.status(400).json({
       success: false,
       error:
-        "Invalid field. Use auto, telegram_id, phone, first_name, or last_name."
+        "Fast index currently supports numeric Telegram ID or phone searches only.",
     });
   }
 
+  const fieldMap: Record<string, string | null> = {
+    auto: null,
+    telegram: "telegram_id",
+    telegram_id: "telegram_id",
+    phone: "phone",
+  };
+
+  if (!(field in fieldMap)) {
+    return res.status(400).json({
+      success: false,
+      error: "Fast indexed fields: auto, telegram_id, phone",
+    });
+  }
+
+  const shard = shardForNumericKey(search);
+
+  if (!shard) {
+    return res.status(400).json({
+      success: false,
+      error: "Invalid numeric search value",
+    });
+  }
+
+  const shardUrl =
+    LOOKUP_BASE + "/lookup_" + shard + ".parquet?download=true";
+
   try {
     const started = Date.now();
-    const { connection, columns } = await getDbState();
+    const { connection } = await getDbState();
 
-    const tg = quoteIdentifier(columns.telegram);
-    const phone = quoteIdentifier(columns.phone);
-    const first = quoteIdentifier(columns.firstName);
-    const last = quoteIdentifier(columns.lastName);
-    const url = quoteLiteral(DATASET_URL);
+    const fieldFilter = fieldMap[field]
+      ? " AND matched_field = $matchedField"
+      : "";
 
-    const projection = `
-      CAST(${tg} AS VARCHAR) AS telegram_id,
-      CAST(${phone} AS VARCHAR) AS phone,
-      CAST(${first} AS VARCHAR) AS first_name,
-      CAST(${last} AS VARCHAR) AS last_name
-    `;
+    const params: Record<string, string> = {
+      q: search,
+    };
 
-    let whereSql: string;
-    let params: Record<string, string>;
-
-    if (field === "telegram" || field === "telegram_id") {
-      whereSql = `CAST(${tg} AS VARCHAR) = $q`;
-      params = { q: search };
-    } else if (field === "phone") {
-      whereSql = `CAST(${phone} AS VARCHAR) = $q`;
-      params = { q: search };
-    } else if (field === "first_name") {
-      whereSql = `lower(trim(CAST(${first} AS VARCHAR))) = $q`;
-      params = { q: search.toLowerCase() };
-    } else if (field === "last_name") {
-      whereSql = `lower(trim(CAST(${last} AS VARCHAR))) = $q`;
-      params = { q: search.toLowerCase() };
-    } else {
-      whereSql = `
-        CAST(${tg} AS VARCHAR) = $raw
-        OR CAST(${phone} AS VARCHAR) = $raw
-        OR lower(trim(CAST(${first} AS VARCHAR))) = $normalized
-        OR lower(trim(CAST(${last} AS VARCHAR))) = $normalized
-      `;
-
-      params = {
-        raw: search,
-        normalized: search.toLowerCase()
-      };
+    if (fieldMap[field]) {
+      params.matchedField = fieldMap[field] as string;
     }
 
     const sql = `
-      SELECT ${projection}
-      FROM read_parquet(${url})
-      WHERE ${whereSql}
-      LIMIT 10
+      SELECT
+        telegram_id,
+        phone,
+        first_name,
+        last_name,
+        matched_field
+      FROM read_parquet(${quoteLiteral(shardUrl)})
+      WHERE lookup_key = $q
+      ${fieldFilter}
+      LIMIT 20
     `;
 
     const reader = await connection.runAndReadAll(sql, params);
@@ -347,20 +249,49 @@ async function searchHandler(req: express.Request, res: express.Response) {
 
     res.setHeader("Cache-Control", "private, no-store");
 
+    if (!rows.length) {
+      return res.status(404).json({
+        success: false,
+        status: "not_found",
+        query: search,
+        field,
+        shard,
+        elapsed_ms: Date.now() - started,
+        results: [],
+      });
+    }
+
     return res.json({
       success: true,
+      status: "success",
       query: search,
       field,
+      shard,
       count: rows.length,
       elapsed_ms: Date.now() - started,
-      results: rows
+      results: rows,
     });
   } catch (error) {
+    const message = String(error);
     console.error("search error", error);
+
+    if (
+      message.includes("404") ||
+      message.includes("HTTP Error") ||
+      message.includes("not found")
+    ) {
+      return res.status(503).json({
+        success: false,
+        status: "index_not_ready",
+        error:
+          "Lookup shards are not available yet. Build/upload lookup-v1 first.",
+        shard,
+      });
+    }
 
     return res.status(500).json({
       success: false,
-      error: "Search backend failed"
+      error: "Search backend failed",
     });
   }
 }
