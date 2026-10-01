@@ -4,7 +4,7 @@ import shutil
 from pathlib import Path
 
 import duckdb
-from huggingface_hub import HfFileSystem
+from huggingface_hub import create_bucket, batch_bucket_files
 
 SOURCE_URL = os.environ.get(
     "SOURCE_URL",
@@ -30,6 +30,9 @@ if not token:
         "HF_TOKEN is missing. Add a GitHub Actions secret named HF_TOKEN "
         "with write access to the target Hugging Face bucket."
     )
+
+print(f"Ensuring private bucket exists: {BUCKET}")
+create_bucket(BUCKET, private=True, exist_ok=True, token=token)
 
 con = duckdb.connect()
 con.execute("INSTALL httpfs")
@@ -153,13 +156,14 @@ for i in range(100):
 if not created:
     raise RuntimeError("No lookup shards were created")
 
-fs = HfFileSystem(token=token)
-
 print(f"Uploading {len(created)} shards to bucket {BUCKET}/{PREFIX}/ ...")
 
 for path in created:
-    remote = f"buckets/{BUCKET}/{PREFIX}/{path.name}"
-    fs.put(str(path), remote)
+    batch_bucket_files(
+        BUCKET,
+        add=[(str(path), f"{PREFIX}/{path.name}")],
+        token=token,
+    )
     print(f"  uploaded {path.name}")
 
 manifest = OUT / "manifest.txt"
@@ -177,7 +181,11 @@ manifest.write_text(
     + "\n",
     encoding="utf-8",
 )
-fs.put(str(manifest), f"buckets/{BUCKET}/{PREFIX}/manifest.txt")
+batch_bucket_files(
+    BUCKET,
+    add=[(str(manifest), f"{PREFIX}/manifest.txt")],
+    token=token,
+)
 
 print("DONE")
 
