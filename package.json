@@ -1,5 +1,5 @@
 {
-  "name": "hf-parquet-search-api",
+  "name": "aim-ai2-private-sharded-api",
   "version": "1.0.0",
   "private": true,
   "type": "module",
@@ -7,7 +7,6 @@
     "node": "24.x"
   },
   "dependencies": {
-    "@duckdb/node-api": "1.5.6-r.1",
     "@types/express": "^5.0.0",
     "express": "^4.21.2"
   },
