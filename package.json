@@ -1,16 +1,17 @@
 {
-  "name": "express",
+  "name": "hf-parquet-search-api",
   "version": "1.0.0",
-  "description": "",
+  "private": true,
   "type": "module",
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "engines": {
+    "node": "24.x"
+  },
   "dependencies": {
+    "@duckdb/node-api": "1.5.6",
     "@types/express": "^5.0.0",
-    "express": "^4.18.2"
+    "express": "^4.21.2"
   },
   "devDependencies": {
-    "@types/node": "^22.0.0"
+    "@types/node": "^24.0.0"
   }
 }
