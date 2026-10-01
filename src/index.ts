@@ -1,659 +1,294 @@
 import express from "express";
 import crypto from "node:crypto";
+import { DuckDBInstance } from "@duckdb/node-api";
 
 const app = express();
-app.use(express.json({ limit: "1mb" }));
 
-const LICENSE_KEY =
-  process.env.LICENSE_KEY || "DEBAN-AIMAI-2026";
+const DATASET_URL =
+  process.env.DATASET_URL ||
+  "https://huggingface.co/datasets/deban420/my-first-data-api/resolve/main/train.parquet";
 
-const SERVER_SECRET =
-  process.env.SERVER_SECRET || "CHANGE_THIS_SECRET";
+// The raw API key is not stored in this public repository.
+// SHA-256(API key) only:
+const API_KEY_SHA256 =
+  process.env.API_KEY_SHA256 ||
+  "01ea8d6a3e5cc51153344f97a924727112ba10b0f51f959928e08a6a734e70d4";
 
-const SIGNER_ID =
-  process.env.SIGNER_ID || "3bb80515895760f5";
-
-const SIGNING_PRIVATE_KEY = (
-  process.env.SIGNING_PRIVATE_KEY || ""
-).replace(/\\n/g, "\n");
-
-function b64url(input: Buffer | string) {
-  return Buffer.from(input)
-    .toString("base64")
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/g, "");
-}
-
-function fromB64url(text: string) {
-  let s = text.replace(/-/g, "+").replace(/_/g, "/");
-
-  while (s.length % 4) {
-    s += "=";
-  }
-
-  return Buffer.from(s, "base64");
-}
-
-function sha256Hex(input: Buffer | string) {
-  return crypto
-    .createHash("sha256")
-    .update(input)
-    .digest("hex");
-}
-
-function hmac(text: string) {
-  return b64url(
-    crypto
-      .createHmac("sha256", SERVER_SECRET)
-      .update(text)
-      .digest()
-  );
-}
-
-function randomToken(bytes = 32) {
-  return b64url(crypto.randomBytes(bytes));
-}
-
-function iso(sec: number) {
-  return new Date(sec * 1000).toISOString();
-}
-
-function normalizeLicense(key: string) {
-  return key.trim().toUpperCase();
-}
-
-/* -----------------------------
-   Challenge ticket
------------------------------- */
-
-function makeChallenge(purpose: string) {
-  const id = crypto.randomBytes(16).toString("hex");
-  const nonce = randomToken(32);
-  const exp = Math.floor(Date.now() / 1000) + 300;
-
-  const raw =
-    `${id}|${nonce}|${purpose}|${exp}`;
-
-  const ticket =
-    b64url(raw) + "." + hmac(raw);
-
-  return {
-    id,
-    nonce,
-    purpose,
-    ticket,
-    exp
+type DbState = {
+  connection: any;
+  columns: {
+    telegram: string;
+    phone: string;
+    firstName: string;
+    lastName: string;
   };
+};
+
+const globalState = globalThis as typeof globalThis & {
+  __hfDbState?: Promise<DbState>;
+  __rateMap?: Map<string, { windowStart: number; count: number }>;
+};
+
+function sha256(value: string) {
+  return crypto.createHash("sha256").update(value).digest("hex");
 }
 
-function verifyChallenge(
-  challengeId: string,
-  nonce: string,
-  purpose: string,
-  ticket: string
-) {
-  const parts = String(ticket).split(".");
-
-  if (parts.length !== 2) {
-    return false;
-  }
-
-  let raw: string;
-
+function safeEqualHex(a: string, b: string) {
   try {
-    raw = fromB64url(parts[0]).toString("utf8");
+    const aa = Buffer.from(a, "hex");
+    const bb = Buffer.from(b, "hex");
+    return aa.length === bb.length && crypto.timingSafeEqual(aa, bb);
   } catch {
     return false;
   }
-
-  const expected = hmac(raw);
-
-  const a = Buffer.from(expected);
-  const b = Buffer.from(parts[1]);
-
-  if (
-    a.length !== b.length ||
-    !crypto.timingSafeEqual(a, b)
-  ) {
-    return false;
-  }
-
-  const fields = raw.split("|");
-
-  if (fields.length !== 4) {
-    return false;
-  }
-
-  const [id, ticketNonce, ticketPurpose, expText] =
-    fields;
-
-  const exp = Number(expText);
-
-  return (
-    id === challengeId &&
-    ticketNonce === nonce &&
-    ticketPurpose === purpose &&
-    Number.isFinite(exp) &&
-    exp >= Math.floor(Date.now() / 1000)
-  );
 }
 
-/* -----------------------------
-   Device public-key hash
------------------------------- */
-
-function getPublicKeyHash(body: any) {
-  /*
-    Normal software identity:
-    identity.publicKey is Base64 DER/SPKI.
-  */
-
-  const pub = body?.identity?.publicKey;
-
-  if (typeof pub === "string" && pub.trim()) {
-    try {
-      const der = Buffer.from(pub, "base64");
-      return sha256Hex(der);
-    } catch {
-      return null;
-    }
-  }
-
-  /*
-    Attestation fallback:
-    first certificate public key.
-  */
-
-  const chain = body?.attestation?.certificateChain;
-
-  if (
-    Array.isArray(chain) &&
-    typeof chain[0] === "string"
-  ) {
-    try {
-      const certBytes = Buffer.from(chain[0], "base64");
-
-      const cert =
-        new crypto.X509Certificate(certBytes);
-
-      const der = cert.publicKey.export({
-        type: "spki",
-        format: "der"
-      }) as Buffer;
-
-      return sha256Hex(der);
-    } catch {
-      return null;
-    }
-  }
-
-  return null;
+function quoteIdentifier(name: string) {
+  return '"' + name.replaceAll('"', '""') + '"';
 }
 
-/* -----------------------------
-   Access grant
------------------------------- */
-
-function createGrant(
-  sessionId: string,
-  publicKeyHash: string,
-  deviceBindingHash: string,
-  licenseKey: string
-) {
-  if (!SIGNING_PRIVATE_KEY) {
-    throw new Error("SIGNING_KEY_NOT_CONFIGURED");
-  }
-
-  const now = Math.floor(Date.now() / 1000);
-
-  /*
-    APK accepts a short grant window.
-  */
-
-  const issuedAt = now;
-  const notBefore = now - 5;
-  const expiresAt = now + 300;
-
-  const licenseId =
-    sha256Hex(normalizeLicense(licenseKey))
-      .slice(0, 16);
-
-  /*
-    Exact 14-field layout required by
-    AccessGrantVerifier:
-
-    0  AEG
-    1  version
-    2  signer ID
-    3  session ID
-    4  key/license ID
-    5  device ID
-    6  public key hash
-    7  reserved
-    8  issuedAt
-    9  notBefore
-    10 expiresAt
-    11 capabilities bitmask
-    12 capability names
-    13 reserved
-  */
-
-  const fields = [
-    "AEG",                       // 0
-    "1",                         // 1
-    SIGNER_ID,                   // 2
-    sessionId,                   // 3
-    licenseId,                   // 4
-    deviceBindingHash,           // 5
-    publicKeyHash,               // 6
-    "",                          // 7
-    String(issuedAt),            // 8
-    String(notBefore),           // 9
-    String(expiresAt),           // 10
-    "1",                         // 11
-    "carrom-pool",               // 12
-    ""                           // 13
-  ];
-
-  const payload = fields.join("|");
-
-  const signature = crypto.sign(
-    "sha256",
-    Buffer.from(payload, "utf8"),
-    {
-      key: SIGNING_PRIVATE_KEY,
-      dsaEncoding: "der"
-    }
-  );
-
-  const token =
-    b64url(Buffer.from(payload, "utf8")) +
-    "." +
-    b64url(signature);
-
-  return {
-    token,
-    expiresAt
-  };
+function quoteLiteral(value: string) {
+  return "'" + value.replaceAll("'", "''") + "'";
 }
 
-/* -----------------------------
-   Stateless refresh token
------------------------------- */
+function authorized(req: express.Request) {
+  const key = String(req.header("x-api-key") || "");
+  if (!key) return false;
+  return safeEqualHex(sha256(key), API_KEY_SHA256);
+}
 
-function makeRefreshToken(
-  sessionId: string,
-  publicKeyHash: string,
-  deviceBindingHash: string
-) {
-  const exp =
-    Math.floor(Date.now() / 1000) +
-    60 * 60 * 24 * 30;
+function rateAllowed(req: express.Request) {
+  if (!globalState.__rateMap) globalState.__rateMap = new Map();
 
-  const body = JSON.stringify({
-    sid: sessionId,
-    pkh: publicKeyHash,
-    dev: deviceBindingHash,
-    exp
+  const now = Date.now();
+  const windowMs = 60_000;
+  const maxRequests = 60;
+  const ip =
+    String(req.headers["x-forwarded-for"] || req.ip || "unknown")
+      .split(",")[0]
+      .trim();
+
+  const existing = globalState.__rateMap.get(ip);
+
+  if (!existing || now - existing.windowStart >= windowMs) {
+    globalState.__rateMap.set(ip, { windowStart: now, count: 1 });
+    return true;
+  }
+
+  existing.count += 1;
+  return existing.count <= maxRequests;
+}
+
+async function createDbState(): Promise<DbState> {
+  const instance = await DuckDBInstance.create(":memory:", {
+    threads: "2",
+    memory_limit: "768MB"
   });
 
-  return b64url(body) + "." + hmac(body);
-}
+  const connection = await instance.connect();
 
-function readRefreshToken(token: string) {
-  try {
-    const [body64, sig] = token.split(".");
+  // httpfs enables HTTP range reads. Parquet metadata/needed column chunks
+  // are fetched remotely instead of downloading the whole file first.
+  await connection.run("INSTALL httpfs");
+  await connection.run("LOAD httpfs");
 
-    if (!body64 || !sig) {
-      return null;
-    }
+  const url = quoteLiteral(DATASET_URL);
 
-    const body =
-      fromB64url(body64).toString("utf8");
+  const schemaReader = await connection.runAndReadAll(
+    `DESCRIBE SELECT * FROM read_parquet(${url})`
+  );
 
-    const expected = hmac(body);
+  const schemaRows = schemaReader.getRowsJson();
 
-    const a = Buffer.from(expected);
-    const b = Buffer.from(sig);
-
-    if (
-      a.length !== b.length ||
-      !crypto.timingSafeEqual(a, b)
-    ) {
-      return null;
-    }
-
-    const obj = JSON.parse(body);
-
-    if (
-      !obj.sid ||
-      !obj.pkh ||
-      !obj.dev ||
-      Number(obj.exp) <
-        Math.floor(Date.now() / 1000)
-    ) {
-      return null;
-    }
-
-    return obj;
-  } catch {
-    return null;
+  if (schemaRows.length < 4) {
+    throw new Error(
+      `Expected at least four columns in Parquet, found ${schemaRows.length}`
+    );
   }
+
+  const names = schemaRows.slice(0, 4).map((row: any[]) => String(row[0]));
+
+  return {
+    connection,
+    columns: {
+      telegram: names[0],
+      phone: names[1],
+      firstName: names[2],
+      lastName: names[3]
+    }
+  };
 }
 
-/* -----------------------------
-   Root
------------------------------- */
+function getDbState() {
+  if (!globalState.__hfDbState) {
+    globalState.__hfDbState = createDbState().catch((error) => {
+      // Allow a later invocation to retry initialization after a transient
+      // remote/network error.
+      globalState.__hfDbState = undefined;
+      throw error;
+    });
+  }
+
+  return globalState.__hfDbState;
+}
 
 app.get("/", (_req, res) => {
   res.json({
     success: true,
-    service: "AIMAI Access API",
-    status: "online"
+    service: "HF Remote Parquet Search API",
+    status: "online",
+    endpoint: "/api?search=VALUE",
+    authentication: "x-api-key header required",
+    modes: ["auto", "telegram_id", "phone", "first_name", "last_name"]
   });
 });
 
-/* -----------------------------
-   Challenge
------------------------------- */
-
-app.post(
-  "/aimai/v2/api/access/challenge",
-  (req, res) => {
-    const purpose =
-      String(req.body?.purpose || "activate");
-
-    if (
-      purpose !== "activate" &&
-      purpose !== "renew"
-    ) {
-      return res.status(400).json({
-        error: {
-          code: "INVALID_PURPOSE",
-          message: "Invalid challenge purpose"
-        }
-      });
-    }
-
-    const c = makeChallenge(purpose);
-
-    /*
-      APK's post() extracts top-level "data".
-    */
+app.get("/health", async (_req, res) => {
+  try {
+    const state = await getDbState();
 
     return res.json({
-      data: {
-        id: c.id,
-        nonce: c.nonce,
-        purpose: c.purpose,
-        ticket: c.ticket,
-        softwareEnrollmentAllowed: true
-      }
+      success: true,
+      status: "ready",
+      source: "Hugging Face remote Parquet",
+      columnsDetected: 4,
+      mappedColumns: Object.keys(state.columns)
+    });
+  } catch (error) {
+    console.error("health/init error", error);
+    return res.status(503).json({
+      success: false,
+      status: "database_unavailable"
     });
   }
-);
+});
 
-/* -----------------------------
-   Activate
------------------------------- */
-
-app.post(
-  "/aimai/v2/api/access/activate",
-  (req, res) => {
-    try {
-      const body = req.body || {};
-
-      const key = String(body.key || "");
-      const deviceBindingHash =
-        String(body.deviceBindingHash || "");
-
-      const challengeId =
-        String(body.challengeId || "");
-
-      const nonce =
-        String(body.nonce || "");
-
-      const ticket =
-        String(body.ticket || "");
-
-      if (
-        !key ||
-        !deviceBindingHash ||
-        !challengeId ||
-        !nonce ||
-        !ticket
-      ) {
-        return res.status(400).json({
-          error: {
-            code: "INVALID_REQUEST",
-            message: "Missing activation fields"
-          }
-        });
-      }
-
-      if (
-        normalizeLicense(key) !==
-        normalizeLicense(LICENSE_KEY)
-      ) {
-        return res.status(403).json({
-          error: {
-            code: "INVALID_KEY",
-            message: "License key is invalid"
-          }
-        });
-      }
-
-      if (
-        !verifyChallenge(
-          challengeId,
-          nonce,
-          "activate",
-          ticket
-        )
-      ) {
-        return res.status(400).json({
-          error: {
-            code: "CHALLENGE_INVALID",
-            message: "Challenge is invalid"
-          }
-        });
-      }
-
-      const publicKeyHash =
-        getPublicKeyHash(body);
-
-      if (!publicKeyHash) {
-        return res.status(400).json({
-          error: {
-            code: "IDENTITY_INVALID",
-            message: "Device public key is missing"
-          }
-        });
-      }
-
-      const sessionId =
-        crypto.randomBytes(32).toString("hex");
-
-      const grant = createGrant(
-        sessionId,
-        publicKeyHash,
-        deviceBindingHash,
-        key
-      );
-
-      const refreshToken =
-        makeRefreshToken(
-          sessionId,
-          publicKeyHash,
-          deviceBindingHash
-        );
-
-      const now =
-        Math.floor(Date.now() / 1000);
-
-      return res.json({
-        data: {
-          sessionId,
-          refreshToken,
-
-          grant: {
-            token: grant.token,
-            expiresAt: iso(grant.expiresAt)
-          },
-
-          profile: {
-            refreshAt: iso(now + 150),
-            active: true,
-            activatedAt: iso(now),
-
-            expiresAt:
-              "2099-12-31T23:59:59Z",
-
-            maskedKey:
-              "DEBAN-****-2026",
-
-            sellerName:
-              "DEBAN"
-          }
-        }
-      });
-    } catch (e) {
-      console.error(e);
-
-      return res.status(500).json({
-        error: {
-          code: "SERVER_ERROR",
-          message: "Activation failed"
-        }
-      });
-    }
+async function searchHandler(req: express.Request, res: express.Response) {
+  if (!authorized(req)) {
+    return res.status(401).json({
+      success: false,
+      error: "Unauthorized"
+    });
   }
-);
 
-/* -----------------------------
-   Renew
------------------------------- */
-
-app.post(
-  "/aimai/v2/api/access/renew",
-  (req, res) => {
-    try {
-      const body = req.body || {};
-
-      const challengeId =
-        String(body.challengeId || "");
-
-      const nonce =
-        String(body.nonce || "");
-
-      const ticket =
-        String(body.ticket || "");
-
-      const sessionId =
-        String(body.sessionId || "");
-
-      const refreshToken =
-        String(body.refreshToken || "");
-
-      if (
-        !verifyChallenge(
-          challengeId,
-          nonce,
-          "renew",
-          ticket
-        )
-      ) {
-        return res.status(400).json({
-          error: {
-            code: "CHALLENGE_INVALID",
-            message: "Challenge is invalid"
-          }
-        });
-      }
-
-      const refresh =
-        readRefreshToken(refreshToken);
-
-      if (
-        !refresh ||
-        refresh.sid !== sessionId
-      ) {
-        return res.status(403).json({
-          error: {
-            code: "REFRESH_INVALID",
-            message: "Refresh token is invalid"
-          }
-        });
-      }
-
-      const grant = createGrant(
-        refresh.sid,
-        refresh.pkh,
-        refresh.dev,
-        LICENSE_KEY
-      );
-
-      const newRefresh =
-        makeRefreshToken(
-          refresh.sid,
-          refresh.pkh,
-          refresh.dev
-        );
-
-      const now =
-        Math.floor(Date.now() / 1000);
-
-      return res.json({
-        data: {
-          sessionId: refresh.sid,
-          refreshToken: newRefresh,
-
-          grant: {
-            token: grant.token,
-            expiresAt: iso(grant.expiresAt)
-          },
-
-          profile: {
-            refreshAt: iso(now + 150),
-            active: true,
-            activatedAt: iso(now),
-
-            expiresAt:
-              "2099-12-31T23:59:59Z",
-
-            maskedKey:
-              "DEBAN-****-2026",
-
-            sellerName:
-              "DEBAN"
-          }
-        }
-      });
-    } catch {
-      return res.status(500).json({
-        error: {
-          code: "SERVER_ERROR",
-          message: "Renew failed"
-        }
-      });
-    }
+  if (!rateAllowed(req)) {
+    return res.status(429).json({
+      success: false,
+      error: "Too many requests"
+    });
   }
-);
 
-/* -----------------------------
-   Logout
------------------------------- */
+  const search = String(req.query.search || "").trim();
+  const field = String(req.query.field || "auto").trim().toLowerCase();
 
-app.post(
-  "/aimai/v2/api/access/logout",
-  (_req, res) => {
+  if (!search) {
+    return res.status(400).json({
+      success: false,
+      error: "Missing search parameter"
+    });
+  }
+
+  if (search.length > 160) {
+    return res.status(400).json({
+      success: false,
+      error: "Search value is too long"
+    });
+  }
+
+  const validFields = new Set([
+    "auto",
+    "telegram",
+    "telegram_id",
+    "phone",
+    "first_name",
+    "last_name"
+  ]);
+
+  if (!validFields.has(field)) {
+    return res.status(400).json({
+      success: false,
+      error:
+        "Invalid field. Use auto, telegram_id, phone, first_name, or last_name."
+    });
+  }
+
+  try {
+    const started = Date.now();
+    const { connection, columns } = await getDbState();
+
+    const tg = quoteIdentifier(columns.telegram);
+    const phone = quoteIdentifier(columns.phone);
+    const first = quoteIdentifier(columns.firstName);
+    const last = quoteIdentifier(columns.lastName);
+    const url = quoteLiteral(DATASET_URL);
+
+    const projection = `
+      CAST(${tg} AS VARCHAR) AS telegram_id,
+      CAST(${phone} AS VARCHAR) AS phone,
+      CAST(${first} AS VARCHAR) AS first_name,
+      CAST(${last} AS VARCHAR) AS last_name
+    `;
+
+    let whereSql: string;
+    let params: Record<string, string>;
+
+    if (field === "telegram" || field === "telegram_id") {
+      whereSql = `CAST(${tg} AS VARCHAR) = $q`;
+      params = { q: search };
+    } else if (field === "phone") {
+      whereSql = `CAST(${phone} AS VARCHAR) = $q`;
+      params = { q: search };
+    } else if (field === "first_name") {
+      whereSql = `lower(trim(CAST(${first} AS VARCHAR))) = $q`;
+      params = { q: search.toLowerCase() };
+    } else if (field === "last_name") {
+      whereSql = `lower(trim(CAST(${last} AS VARCHAR))) = $q`;
+      params = { q: search.toLowerCase() };
+    } else {
+      whereSql = `
+        CAST(${tg} AS VARCHAR) = $raw
+        OR CAST(${phone} AS VARCHAR) = $raw
+        OR lower(trim(CAST(${first} AS VARCHAR))) = $normalized
+        OR lower(trim(CAST(${last} AS VARCHAR))) = $normalized
+      `;
+
+      params = {
+        raw: search,
+        normalized: search.toLowerCase()
+      };
+    }
+
+    const sql = `
+      SELECT ${projection}
+      FROM read_parquet(${url})
+      WHERE ${whereSql}
+      LIMIT 10
+    `;
+
+    const reader = await connection.runAndReadAll(sql, params);
+    const rows = reader.getRowObjectsJson();
+
+    res.setHeader("Cache-Control", "private, no-store");
+
     return res.json({
-      data: {
-        success: true
-      }
+      success: true,
+      query: search,
+      field,
+      count: rows.length,
+      elapsed_ms: Date.now() - started,
+      results: rows
+    });
+  } catch (error) {
+    console.error("search error", error);
+
+    return res.status(500).json({
+      success: false,
+      error: "Search backend failed"
     });
   }
-);
+}
+
+app.get("/api", searchHandler);
+app.get("/api/search", searchHandler);
 
 export default app;
