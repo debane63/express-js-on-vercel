@@ -24,6 +24,13 @@ for p in (STAGE, OUT):
         shutil.rmtree(p)
     p.mkdir(parents=True, exist_ok=True)
 
+token = os.environ.get("HF_TOKEN")
+if not token:
+    raise RuntimeError(
+        "HF_TOKEN is missing. Add a GitHub Actions secret named HF_TOKEN "
+        "with write access to the target Hugging Face bucket."
+    )
+
 con = duckdb.connect()
 con.execute("INSTALL httpfs")
 con.execute("LOAD httpfs")
@@ -145,13 +152,6 @@ for i in range(100):
 
 if not created:
     raise RuntimeError("No lookup shards were created")
-
-token = os.environ.get("HF_TOKEN")
-if not token:
-    raise RuntimeError(
-        "HF_TOKEN is missing. Add a GitHub Actions secret named HF_TOKEN "
-        "with write access to the target Hugging Face bucket."
-    )
 
 fs = HfFileSystem(token=token)
 
