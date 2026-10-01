@@ -150,13 +150,26 @@ app.get("/", (_req, res) => {
 app.get("/health", async (_req, res) => {
   try {
     const state = await getDbState();
+    const tg = quoteIdentifier(state.columns.telegram);
+    const url = quoteLiteral(DATASET_URL);
+
+    // Harmless exact-filter probe: validates the same remote Parquet query
+    // path used by /api without exposing or looking up a real identifier.
+    await state.connection.runAndReadAll(
+      `SELECT 1
+       FROM read_parquet(${url})
+       WHERE CAST(${tg} AS VARCHAR) = $q
+       LIMIT 1`,
+      { q: "__hf_api_health_probe_74fa2c__" }
+    );
 
     return res.json({
       success: true,
       status: "ready",
       source: "Hugging Face remote Parquet",
       columnsDetected: 4,
-      mappedColumns: Object.keys(state.columns)
+      mappedColumns: Object.keys(state.columns),
+      exactFilterProbe: "ok"
     });
   } catch (error) {
     console.error("health/init error", error);
