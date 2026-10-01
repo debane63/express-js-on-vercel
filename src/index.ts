@@ -87,6 +87,10 @@ async function createDbState(): Promise<DbState> {
 
   const connection = await instance.connect();
 
+  // Vercel functions do not expose a normal HOME directory. DuckDB needs
+  // one for extension installation/cache, so use the writable /tmp volume.
+  await connection.run("SET home_directory='/tmp'");
+
   // httpfs enables HTTP range reads. Parquet metadata/needed column chunks
   // are fetched remotely instead of downloading the whole file first.
   await connection.run("INSTALL httpfs");
