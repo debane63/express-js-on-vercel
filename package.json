@@ -7,7 +7,7 @@
     "node": "24.x"
   },
   "dependencies": {
-    "@duckdb/node-api": "1.5.6",
+    "@duckdb/node-api": "1.5.6-r.1",
     "@types/express": "^5.0.0",
     "express": "^4.21.2"
   },
