@@ -1,0 +1,31 @@
+name: Check HF Bucket
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    if: github.event.issue.title == 'CHECK_HF_BUCKET'
+    runs-on: ubuntu-latest
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -q "huggingface_hub>=1.0,<2"
+      - name: Check bucket
+        run: |
+          python - <<'PY'
+          import os
+          from huggingface_hub import bucket_info
+          info = bucket_info("deban420/my-fast-data-bucket", token=os.environ["HF_TOKEN"])
+          print("BUCKET_EXISTS=true")
+          print("BUCKET_PRIVATE=" + str(info.private).lower())
+          print("BUCKET_FILES=" + str(info.total_files))
+          print("BUCKET_SIZE=" + str(info.size))
+          PY
