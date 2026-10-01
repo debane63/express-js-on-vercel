@@ -169,7 +169,35 @@ app.get("/health", async (_req, res) => {
       source: "Hugging Face remote Parquet",
       columnsDetected: 4,
       mappedColumns: Object.keys(state.columns),
-      exactFilterProbe: "ok"
+      exactFilterProbe: "ok",
+      datasetServerFilter: await (async () => {
+        const started = Date.now();
+        const where = '"Telegram ID"=\'__hf_api_health_probe_74fa2c__\'';
+        const u = new URL("https://datasets-server.huggingface.co/filter");
+        u.searchParams.set("dataset", "deban420/my-first-data-api");
+        u.searchParams.set("config", "default");
+        u.searchParams.set("split", "train");
+        u.searchParams.set("where", where);
+        u.searchParams.set("offset", "0");
+        u.searchParams.set("length", "1");
+        try {
+          const r = await fetch(u, { signal: AbortSignal.timeout(15000) });
+          const body = await r.text();
+          return {
+            status: r.status,
+            ok: r.ok,
+            elapsed_ms: Date.now() - started,
+            preview: body.slice(0, 160)
+          };
+        } catch (e) {
+          return {
+            status: 0,
+            ok: false,
+            elapsed_ms: Date.now() - started,
+            preview: String(e).slice(0, 160)
+          };
+        }
+      })()
     });
   } catch (error) {
     console.error("health/init error", error);
