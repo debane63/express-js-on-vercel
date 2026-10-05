@@ -254,13 +254,27 @@ async function liveSearch(req: express.Request, res: express.Response) {
   url.searchParams.set("offset", "0");
   url.searchParams.set("length", "10");
 
-  const upstream = await fetchJson(url.toString(), 240_000);
+  let upstream = await fetchJson(url.toString(), 240_000);
+  let attempts = 1;
+
+  while (
+    !upstream.ok &&
+    attempts < 5 &&
+    /index is loading/i.test(String(upstream.body?.error || ""))
+  ) {
+    await new Promise((resolve) => setTimeout(resolve, 12_000));
+    upstream = await fetchJson(url.toString(), 240_000);
+    attempts += 1;
+  }
 
   if (!upstream.ok) {
-    return res.status(upstream.status || 502).json({
+    const loading = /index is loading/i.test(String(upstream.body?.error || ""));
+    return res.status(loading ? 503 : upstream.status || 502).json({
       success: false,
-      error: "Hugging Face filter query failed",
+      error: loading ? "Dataset index is still loading" : "Hugging Face filter query failed",
       upstreamStatus: upstream.status,
+      attempts,
+      retryable: loading,
       upstream: upstream.body,
     });
   }
@@ -279,6 +293,7 @@ async function liveSearch(req: express.Request, res: express.Response) {
     found: results.length > 0,
     count: results.length,
     partial_index: Boolean(upstream.body?.partial),
+    attempts,
     results,
   });
 }
