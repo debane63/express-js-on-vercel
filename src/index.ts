@@ -3,12 +3,14 @@ import express from "express";
 const app = express();
 
 const DATASET = "tfqdeadlo/Tgdata";
+const CONFIG = "default";
+const SPLIT = "train";
 const HUB_API = `https://huggingface.co/api/datasets/${DATASET}`;
 const DATASETS_SERVER = "https://datasets-server.huggingface.co";
 
 type Json = Record<string, any>;
 
-async function fetchJson(url: string, timeoutMs = 20_000): Promise<{ ok: boolean; status: number; body: any }> {
+async function fetchJson(url: string, timeoutMs = 30_000): Promise<{ ok: boolean; status: number; body: any }> {
   try {
     const response = await fetch(url, {
       headers: { accept: "application/json" },
@@ -29,11 +31,39 @@ async function fetchJson(url: string, timeoutMs = 20_000): Promise<{ ok: boolean
     return {
       ok: false,
       status: 502,
-      body: {
-        error: error instanceof Error ? error.message : String(error),
-      },
+      body: { error: error instanceof Error ? error.message : String(error) },
     };
   }
+}
+
+function redactRow(row: Record<string, any>) {
+  return {
+    user_id: row?.user_id ?? null,
+    username: row?.username ?? null,
+    first_name: row?.first_name ?? null,
+    last_name: row?.last_name ?? null,
+    phone: row?.phone ? "[redacted]" : null,
+    email: row?.email ? "[redacted]" : null,
+    status: row?.status ?? null,
+    linked_id: row?.linked_id ?? null,
+    linked_name: row?.linked_name ?? null,
+    linked_handle: row?.linked_handle ?? null,
+  };
+}
+
+function escapeSqlString(value: string) {
+  return value.replace(/'/g, "''");
+}
+
+function buildWhere(field: string, value: string) {
+  const numericFields = new Set(["user_id"]);
+
+  if (numericFields.has(field)) {
+    if (!/^\d+$/.test(value)) throw new Error("user_id must contain digits only");
+    return `"${field}"=${value}`;
+  }
+
+  return `"${field}"='${escapeSqlString(value)}'`;
 }
 
 function publicDatasetMetadata(raw: Json) {
@@ -67,13 +97,9 @@ function extractSchema(raw: any) {
     for (const [configName, cfg] of Object.entries(datasetInfo)) {
       const c: any = cfg;
       if (!c || typeof c !== "object") continue;
-
       const features = c.features ?? c?.dataset_info?.features;
       if (features && typeof features === "object") {
-        out.push({
-          config: configName,
-          fields: features,
-        });
+        out.push({ config: configName, fields: features });
       }
     }
   }
@@ -81,39 +107,78 @@ function extractSchema(raw: any) {
   return out;
 }
 
-function extractSplits(raw: any) {
-  if (Array.isArray(raw?.splits)) {
-    return raw.splits.map((s: any) => ({
-      config: s?.config ?? null,
-      split: s?.split ?? null,
-      num_examples: s?.num_examples ?? null,
-      num_bytes: s?.num_bytes ?? null,
-    }));
-  }
-  return raw;
-}
-
 app.get("/", (_req, res) => {
   res.json({
     success: true,
-    service: "Tgdata Safe Dataset API",
+    service: "Tgdata Query Test API",
     status: "online",
     dataset: DATASET,
-    privacy: "This service never returns row-level phone/email/personal-record values.",
+    mode: "live Hugging Face dataset query",
     endpoints: {
+      tester: "/tester",
+      lookup: "/api/lookup?user_id=1646744189",
+      search: "/api/search?search=1646744189&field=user_id",
       health: "/health",
       dataset: "/api/dataset",
-      files: "/api/files",
       schema: "/api/schema",
-      splits: "/api/splits",
-      metadata_search: "/api/search?q=parquet",
     },
+    note: "Phone/email values are redacted in responses.",
   });
+});
+
+app.get("/tester", (_req, res) => {
+  res.type("html").send(`<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Tgdata API Tester</title>
+<style>
+*{box-sizing:border-box} body{font-family:system-ui;background:#0b0b0f;color:#fff;margin:0;padding:20px}
+.wrap{max-width:760px;margin:auto} input,select,button{width:100%;padding:14px;margin-top:10px;border-radius:10px;border:1px solid #333;background:#17171d;color:white;font-size:16px}
+button{font-weight:700;cursor:pointer} pre{white-space:pre-wrap;word-break:break-word;background:#111117;padding:16px;border-radius:12px;min-height:180px}
+.note{color:#aaa;font-size:13px;margin:8px 0 16px}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h2>Tgdata API Tester</h2>
+<div class="note">Queries the Hugging Face dataset directly. Sensitive values are redacted.</div>
+<input id="search" value="1646744189" placeholder="Search value">
+<select id="field">
+<option value="user_id">user_id</option>
+<option value="username">username</option>
+<option value="status">status</option>
+<option value="linked_id">linked_id</option>
+<option value="linked_handle">linked_handle</option>
+</select>
+<button id="go">Search</button>
+<pre id="out">Ready.</pre>
+</div>
+<script>
+const go=document.getElementById("go");
+const out=document.getElementById("out");
+go.onclick=async()=>{
+  const search=document.getElementById("search").value.trim();
+  const field=document.getElementById("field").value;
+  go.disabled=true; out.textContent="Searching...";
+  try{
+    const u=new URL("/api/search",location.origin);
+    u.searchParams.set("search",search);
+    u.searchParams.set("field",field);
+    const r=await fetch(u,{cache:"no-store"});
+    const t=await r.text();
+    try{out.textContent=JSON.stringify(JSON.parse(t),null,2)}catch{out.textContent=t}
+  }catch(e){out.textContent=String(e)}
+  finally{go.disabled=false}
+};
+</script>
+</body>
+</html>`);
 });
 
 app.get("/health", async (_req, res) => {
   const upstream = await fetchJson(HUB_API, 10_000);
-
   res.status(upstream.ok ? 200 : 502).json({
     success: upstream.ok,
     status: upstream.ok ? "ready" : "upstream_unavailable",
@@ -125,7 +190,6 @@ app.get("/health", async (_req, res) => {
 
 app.get("/api/dataset", async (_req, res) => {
   const upstream = await fetchJson(HUB_API);
-
   if (!upstream.ok) {
     return res.status(upstream.status || 502).json({
       success: false,
@@ -133,123 +197,102 @@ app.get("/api/dataset", async (_req, res) => {
       upstreamStatus: upstream.status,
     });
   }
-
-  return res.json({
-    success: true,
-    dataset: publicDatasetMetadata(upstream.body),
-  });
-});
-
-app.get("/api/files", async (_req, res) => {
-  const upstream = await fetchJson(HUB_API);
-
-  if (!upstream.ok) {
-    return res.status(upstream.status || 502).json({
-      success: false,
-      error: "Unable to read Hugging Face dataset files",
-      upstreamStatus: upstream.status,
-    });
-  }
-
-  const metadata = publicDatasetMetadata(upstream.body);
-  return res.json({
-    success: true,
-    dataset: DATASET,
-    count: metadata.files.length,
-    files: metadata.files,
-  });
+  return res.json({ success: true, dataset: publicDatasetMetadata(upstream.body) });
 });
 
 app.get("/api/schema", async (_req, res) => {
   const url = `${DATASETS_SERVER}/info?dataset=${encodeURIComponent(DATASET)}`;
-  const upstream = await fetchJson(url, 30_000);
-
+  const upstream = await fetchJson(url);
   if (!upstream.ok) {
     return res.status(upstream.status || 502).json({
       success: false,
-      error: "Hugging Face dataset schema is not currently available",
+      error: "Dataset schema unavailable",
       upstreamStatus: upstream.status,
     });
   }
-
-  return res.json({
-    success: true,
-    dataset: DATASET,
-    schema: extractSchema(upstream.body),
-  });
+  return res.json({ success: true, dataset: DATASET, schema: extractSchema(upstream.body) });
 });
 
-app.get("/api/splits", async (_req, res) => {
-  const url = `${DATASETS_SERVER}/splits?dataset=${encodeURIComponent(DATASET)}`;
-  const upstream = await fetchJson(url, 30_000);
+async function liveSearch(req: express.Request, res: express.Response) {
+  const search = String(req.query.search ?? req.query.q ?? "").trim();
+  const field = String(req.query.field ?? "user_id").trim().toLowerCase();
 
-  if (!upstream.ok) {
-    return res.status(upstream.status || 502).json({
-      success: false,
-      error: "Hugging Face split metadata is not currently available",
-      upstreamStatus: upstream.status,
-    });
-  }
-
-  return res.json({
-    success: true,
-    dataset: DATASET,
-    splits: extractSplits(upstream.body),
-  });
-});
-
-app.get("/api/search", async (req, res) => {
-  const q = String(req.query.q || "").trim().toLowerCase();
-
-  if (!q || q.length > 100) {
-    return res.status(400).json({
-      success: false,
-      error: "q is required and must be 1-100 characters",
-    });
-  }
-
-  const [metaResult, infoResult] = await Promise.all([
-    fetchJson(HUB_API),
-    fetchJson(`${DATASETS_SERVER}/info?dataset=${encodeURIComponent(DATASET)}`, 30_000),
+  const allowedFields = new Set([
+    "user_id",
+    "username",
+    "status",
+    "linked_id",
+    "linked_handle",
   ]);
 
-  const metadata = metaResult.ok ? publicDatasetMetadata(metaResult.body) : null;
-  const files = metadata?.files ?? [];
-  const matchedFiles = files.filter((f: any) =>
-    String(f?.rfilename || "").toLowerCase().includes(q),
-  );
-
-  const schema = infoResult.ok ? extractSchema(infoResult.body) : [];
-  const matchedFields: Array<{ config: string; field: string; type: any }> = [];
-
-  for (const entry of schema) {
-    const fields = entry?.fields;
-    if (!fields || typeof fields !== "object") continue;
-
-    for (const [name, type] of Object.entries(fields)) {
-      if (name.toLowerCase().includes(q)) {
-        matchedFields.push({ config: entry.config, field: name, type });
-      }
-    }
+  if (!search || search.length > 160) {
+    return res.status(400).json({ success: false, error: "search is required" });
   }
+
+  if (!allowedFields.has(field)) {
+    return res.status(400).json({
+      success: false,
+      error: "field must be user_id, username, status, linked_id, or linked_handle",
+    });
+  }
+
+  let where: string;
+  try {
+    where = buildWhere(field, search);
+  } catch (error) {
+    return res.status(400).json({
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  const url = new URL(`${DATASETS_SERVER}/filter`);
+  url.searchParams.set("dataset", DATASET);
+  url.searchParams.set("config", CONFIG);
+  url.searchParams.set("split", SPLIT);
+  url.searchParams.set("where", where);
+  url.searchParams.set("offset", "0");
+  url.searchParams.set("length", "10");
+
+  const upstream = await fetchJson(url.toString(), 60_000);
+
+  if (!upstream.ok) {
+    return res.status(upstream.status || 502).json({
+      success: false,
+      error: "Hugging Face filter query failed",
+      upstreamStatus: upstream.status,
+      upstream: upstream.body,
+    });
+  }
+
+  const rows = Array.isArray(upstream.body?.rows) ? upstream.body.rows : [];
+  const results = rows.map((item: any) => ({
+    row_idx: item?.row_idx ?? null,
+    row: redactRow(item?.row ?? {}),
+  }));
 
   return res.json({
     success: true,
-    query: q,
-    scope: "dataset metadata only",
     dataset: DATASET,
-    matches: {
-      files: matchedFiles,
-      schemaFields: matchedFields,
-    },
+    field,
+    query: search,
+    found: results.length > 0,
+    count: results.length,
+    partial_index: Boolean(upstream.body?.partial),
+    results,
   });
+}
+
+app.get("/api/search", liveSearch);
+
+app.get("/api/lookup", async (req, res) => {
+  req.query.search = req.query.user_id;
+  req.query.field = "user_id";
+  return liveSearch(req, res);
 });
 
 app.use((_req, res) => {
-  res.status(404).json({
-    success: false,
-    error: "Not found",
-  });
+  res.status(404).json({ success: false, error: "Not found" });
 });
 
 export default app;
