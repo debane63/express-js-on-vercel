@@ -254,7 +254,7 @@ async function liveSearch(req: express.Request, res: express.Response) {
   url.searchParams.set("offset", "0");
   url.searchParams.set("length", "10");
 
-  const upstream = await fetchJson(url.toString(), 60_000);
+  const upstream = await fetchJson(url.toString(), 240_000);
 
   if (!upstream.ok) {
     return res.status(upstream.status || 502).json({
