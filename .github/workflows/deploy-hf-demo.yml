@@ -2,6 +2,12 @@ name: Deploy Hugging Face demo
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - hf-write-bridge
+    paths:
+      - ".github/workflows/deploy-hf-demo.yml"
+      - "hf_deploy/**"
 
 jobs:
   deploy:
